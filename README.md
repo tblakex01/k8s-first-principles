@@ -19,6 +19,7 @@
 [![Repo size](https://img.shields.io/github/repo-size/tblakex01/k8s-first-principles)](https://github.com/tblakex01/k8s-first-principles)
 [![Last commit](https://img.shields.io/github/last-commit/tblakex01/k8s-first-principles)](https://github.com/tblakex01/k8s-first-principles/commits)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/tblakex01/k8s-first-principles/pulls)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
 <br>
 
@@ -284,7 +285,14 @@ hardcoded outcome. Before opening a PR that touches the engine:
 2. `node src/build.mjs` and commit the regenerated `index.html`.
 3. If you changed a mechanism, update `MODEL.md` so the docs stay truthful.
 
-See **[CLAUDE.md](CLAUDE.md)** for architecture, invariants, and conventions.
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full workflow and definition of
+done, and **[CLAUDE.md](CLAUDE.md)** for architecture, invariants, and conventions.
+
+---
+
+## 📄 License
+
+Released under the [MIT License](LICENSE). © 2026 Anthony M ([@tblakex01](https://github.com/tblakex01)).
 
 ---
 
