@@ -1,0 +1,180 @@
+<div class="app">
+  <header class="topbar">
+    <h1>Bin-pack &amp; Evict
+      <small>emergent Kubernetes memory-pressure lab — every tick advances a state model; nothing is scripted</small>
+    </h1>
+    <div class="runbar">
+      <span id="cascadeChip" class="cascade-chip">cascade: quiet</span>
+      <span id="clock" class="mono" style="font-size:12px;color:var(--ink-2)">t=0s</span>
+      <button id="btnPlay" class="primary" aria-label="Play or pause simulation">Pause</button>
+      <button id="btnStep">Step</button>
+      <select id="speed" aria-label="Simulation speed">
+        <option value="1">1×</option>
+        <option value="2">2×</option>
+        <option value="5" selected>5×</option>
+        <option value="10">10×</option>
+        <option value="30">30×</option>
+        <option value="60">60×</option>
+      </select>
+      <button id="btnLeak" class="danger">Inject leak</button>
+      <button id="btnReset">Reset ⟲</button>
+    </div>
+  </header>
+
+  <div class="cols">
+    <aside class="controls">
+      <div class="panel">
+        <h3 class="panel-title">Scenarios</h3>
+        <div class="preset-row" id="presets"></div>
+      </div>
+      <div class="panel" id="ctlPanel"></div>
+    </aside>
+
+    <main>
+      <section class="tiles" id="tiles"></section>
+
+      <section class="nodes-wrap">
+        <div id="nodes"></div>
+        <svg id="arcs" aria-hidden="true"></svg>
+      </section>
+
+      <section class="lower">
+        <div class="panel">
+          <h3 class="panel-title">Cluster memory — 10 minute window</h3>
+          <div class="legend">
+            <span><i class="dot" style="background:var(--qos-g)"></i>working set (kernel view)</span>
+            <span><i class="dot" style="background:var(--qos-b)"></i>Σ requests committed (scheduler view)</span>
+            <span><i class="dot" style="background:var(--baseline)"></i>capacity</span>
+            <span><i class="dot" style="background:var(--muted);height:2px"></i>allocatable</span>
+            <span><i class="dot" style="background:var(--st-serious)"></i>eviction</span>
+            <span><i class="dot" style="background:var(--st-crit)"></i>kernel OOM</span>
+            <span><i class="dot" style="background:var(--st-warn)"></i>container OOM</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="chart" height="248"></canvas>
+            <div class="chart-tip" id="chartTip"></div>
+          </div>
+          <div class="spark-title">Pending / unschedulable pods <b id="pendingNow">0</b></div>
+          <canvas id="pending" height="44"></canvas>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">Events</h3>
+          <div id="log" aria-live="off"></div>
+        </div>
+      </section>
+
+      <details class="notes" id="modelNotes">
+        <summary>Model documentation — state-update rules &amp; the cascade feedback loop</summary>
+        <div class="notes-body">
+          <h4>Fidelity commitment</h4>
+          <p>The simulation encodes the specific mechanisms that produce memory-pressure
+          cascades on real clusters, at one-second resolution. Memory is the only resource
+          dimension. Everything you see — including any cascade — is produced by the update
+          rules below acting on state; there is no timeline, no canned sequence, and the
+          RNG is seeded (same seed ⇒ identical run).</p>
+
+          <h4>State-update rules (one tick = 1 s, in this order)</h4>
+          <ul>
+            <li><b>1. Pod working sets.</b> Each running pod's usage follows a mean-reverting
+              approach to a per-pod target: <code>U += (T − U)/τ · s + ε</code>, where
+              <code>ε ~ N(0, σ²)</code> and <code>s = 1 − 0.6·PSI<sub>full</sub></code> is a
+              reclaim-stall throttle. Targets are drawn per pod as a fraction of the
+              <em>limit</em> (default 75% ± 20%, capped at 92%) — apps grow into the room their
+              limit grants, not their request. Leaky pods additionally gain
+              <code>leakRate</code> Mi/s forever. Terminating pods drain linearly over their
+              grace period; backoff pods hold zero.</li>
+            <li><b>2. cgroup v2 <code>memory.max</code>.</b> Any container whose usage reaches
+              its limit is OOM-killed <em>in place</em> (the pod object stays bound): usage → 0,
+              CrashLoopBackOff delay 10 s·2ⁿ capped at 300 s, then restart and regrow.</li>
+            <li><b>3. Kernel OOM (every tick — the kernel doesn't wait for kubelet).</b> If a
+              node's working set (Σ pod usage + system daemons) reaches physical capacity, the
+              kernel kills the container with the highest
+              <code>oom_score = 1000·usage/capacity + oom_score_adj</code>, using kubelet's real
+              adj values: Guaranteed −997, BestEffort 1000, Burstable
+              <code>min(max(2, 1000 − 1000·request/capacity), 999)</code>. Kernel OOM kills
+              restart in place, like rule 2.</li>
+            <li><b>4. Kubelet eviction manager (every 10 s per node, staggered).</b> Signal:
+              <code>memory.available = capacity − workingSet</code>. If below the <em>hard</em>
+              threshold: evict one pod immediately, no grace. If below the <em>soft</em>
+              threshold continuously for the grace period: evict one pod with
+              <code>min(pod grace, eviction-max-pod-grace-period)</code>. Victim ranking is the
+              real one: pods whose usage exceeds requests first (all BestEffort usage
+              qualifies), then lower priority, then largest usage-over-request. Either signal
+              sets the <code>MemoryPressure</code> condition ⇒ <code>NoSchedule</code> taint,
+              held for the pressure-transition period after the signal clears. Eviction marks
+              the pod Failed at once: the scheduler stops counting its requests even while
+              memory drains — a real and consequential gap.</li>
+            <li><b>5. Controller.</b> Each evicted/drained pod's controller creates a
+              replacement after a short informer delay. Restarts (rules 2–3) do <em>not</em>
+              reschedule — that distinction is why leaks crashloop in place but evictions
+              travel. Pod specs are immutable: changing request/limit sliders rolls the
+              workload gradually (bounded replacements per tick), as a Deployment would.</li>
+            <li><b>6. Scheduler.</b> Filters on <em>requests only</em> against
+              <code>allocatable = capacity − reserved − evictionHard</code> (the real allocatable
+              formula — raising the hard threshold genuinely shrinks what the scheduler may
+              book), excludes tainted nodes, then scores by MostAllocated (bin-pack) or
+              LeastAllocated (spread). The scheduler never sees actual usage. Unschedulable
+              pods retry with backoff and are shown as Pending.</li>
+            <li><b>7. Telemetry.</b> Node PSI is derived from proximity to exhaustion
+              (reclaim-stall proxy); metrics and events append to the history that drives the
+              charts.</li>
+          </ul>
+
+          <h4>The feedback loop that makes a cascade</h4>
+          <p>With limits above requests and working sets that track limits, a bin-packed node
+          hosts more demand than it has physical memory — the scheduler booked requests, the
+          kernel serves usage. The loop:
+          <b>growth</b> pushes a packed node's <code>memory.available</code> under a threshold →
+          <b>kubelet evicts</b> (or, if growth outruns the 10 s housekeeping cadence, the
+          <b>kernel OOM-kills</b> first) → the eviction frees <em>requests</em> in the
+          scheduler's books and taints the node → the <b>controller replaces</b> the pod →
+          the <b>scheduler, blind to usage</b>, bin-packs the replacement onto the
+          most-committed untainted node — typically the next-most-loaded one → the replacement
+          <b>regrows toward the same target</b> and tips that node → repeat. Taints concentrate
+          refugees on ever-fewer nodes (accelerating the wave); when transition periods lapse,
+          pods flood back and the wave can oscillate. The loop terminates only when the state
+          makes it terminate: demand shed below capacity, pods parked Pending, or parameters
+          that keep usage inside requests.</p>
+
+          <h4>Prove the emergence to yourself</h4>
+          <ul>
+            <li><b>Relax limits:</b> drag <em>Limit : request</em> to 1.00×. Pods become
+              Guaranteed; usage can no longer exceed what the scheduler booked, so
+              Σ working set ≤ Σ requests ≤ allocatable and no threshold can trip. As the
+              rolling replacement completes, the cascade dies — kills stop, pressure clears.</li>
+            <li><b>Raise thresholds:</b> push soft/hard eviction up (e.g. 1536/1024 Mi). Two
+              real effects compound: allocatable shrinks (scheduler books less per node) and
+              kubelet acts before the kernel — kernel OOMs collapse and the failure mode turns
+              into orderly early eviction + Pending backlog.</li>
+            <li><b>Shrink demand:</b> lower <em>Mean working set</em> to ~45%. Same overcommit
+              ratio, but after a transient the evictions rebalance packing below the hazard
+              density and the cluster goes quiet — the cascade is a property of the state, not
+              of the code path.</li>
+            <li><b>Inject a leak:</b> one Burstable pod with a generous limit drags its node
+              into pressure; watch neighbors get evicted (they exceed requests; the leaker may
+              crashloop in place) and the displaced load propagate.</li>
+          </ul>
+          <p>The same engine (<code>src/engine.js</code>) runs headlessly:
+          <code>node src/verify.mjs</code> asserts all four behaviors plus determinism across
+          seeds. See <code>MODEL.md</code> for the full ground-truth-vs-model table.</p>
+
+          <h4>Deliberate simplifications (and why they're safe here)</h4>
+          <ul>
+            <li>All pod memory is anonymous; page cache isn't modeled. Kubelet's
+              <code>memory.available</code> already excludes reclaimable <code>inactive_file</code>,
+              so this matches the signal's semantics while skipping the reclaim buffer that
+              delays — but doesn't change — the dynamics.</li>
+            <li>PSI is a derived proximity-to-exhaustion proxy shown per node and used only to
+              stall allocation; real kubelets don't act on PSI either (PSI-based eviction is
+              still alpha).</li>
+            <li>One container per pod; CPU, pids, and disk eviction signals omitted; scheduler
+              reduced to NodeResourcesFit + taints (no affinity/spread constraints); kernel OOM
+              kills one victim per pass; <code>--eviction-pressure-transition-period</code>
+              defaults to 60 s here (real default 300 s) so oscillations are watchable.</li>
+          </ul>
+        </div>
+      </details>
+    </main>
+  </div>
+</div>
+<div class="pod-tip" id="podTip"></div>
