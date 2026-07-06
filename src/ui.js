@@ -396,9 +396,13 @@ function themeColors() {
 }
 function setupCanvas(cv) {
   const dpr = window.devicePixelRatio || 1;
-  const w = cv.clientWidth, h = +cv.getAttribute('height');
+  // The height attribute doubles as the design height, but assigning cv.height
+  // below overwrites it — capture it once, or every frame re-scales by dpr.
+  if (!cv.dataset.cssHeight) cv.dataset.cssHeight = cv.getAttribute('height');
+  const w = cv.clientWidth, h = +cv.dataset.cssHeight;
   if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
     cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    cv.style.height = h + 'px';
   }
   const ctx = cv.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
