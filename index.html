@@ -1,0 +1,1597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bin-pack &amp; Evict — Kubernetes memory-pressure lab</title>
+<style>
+:root {
+  --page: #f9f9f7; --surface: #fcfcfb;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --baseline: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --qos-g: #2a78d6;   /* Guaranteed  (categorical slot 1) */
+  --qos-b: #1baf7a;   /* Burstable   (slot 2) */
+  --qos-be: #eda100;  /* BestEffort  (slot 3) */
+  --accent: #4a3aa7;  /* pending / scheduler view (slot 5) */
+  --st-good: #0ca30c; --st-warn: #fab219; --st-serious: #ec835a; --st-crit: #d03b3b;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --qos-g: #3987e5; --qos-b: #199e70; --qos-be: #c98500;
+    --accent: #9085e9;
+  }
+}
+:root[data-theme="light"] {
+  --page: #f9f9f7; --surface: #fcfcfb;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --baseline: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --qos-g: #2a78d6; --qos-b: #1baf7a; --qos-be: #eda100;
+  --accent: #4a3aa7;
+}
+:root[data-theme="dark"] {
+  --page: #0d0d0d; --surface: #1a1a19;
+  --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --baseline: #383835;
+  --border: rgba(255,255,255,0.10);
+  --qos-g: #3987e5; --qos-b: #199e70; --qos-be: #c98500;
+  --accent: #9085e9;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font-family: var(--sans); font-size: 14px; line-height: 1.45;
+}
+.app { max-width: 1360px; margin: 0 auto; padding: 16px 20px 48px; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* ---------- header ---------- */
+.topbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+  padding: 6px 0 14px;
+}
+.topbar h1 {
+  font-size: 19px; font-weight: 650; margin: 0; letter-spacing: -0.01em;
+}
+.topbar h1 small {
+  display: block; font-size: 12px; font-weight: 400; color: var(--ink-2);
+  letter-spacing: 0;
+}
+.runbar { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+button, select {
+  font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 5px 12px; cursor: pointer;
+}
+button:hover, select:hover { border-color: var(--baseline); }
+button:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 2px solid var(--qos-g); outline-offset: 1px;
+}
+button.primary { background: var(--ink); color: var(--page); border-color: var(--ink); font-weight: 600; min-width: 78px; }
+button.danger { color: var(--st-crit); border-color: var(--st-crit); }
+.cascade-chip {
+  font-family: var(--mono); font-size: 12px; padding: 4px 10px;
+  border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2);
+}
+.cascade-chip.active {
+  border-color: var(--st-crit); color: var(--st-crit); font-weight: 700;
+  animation: cascadePulse 1.2s ease-in-out infinite;
+}
+@keyframes cascadePulse { 50% { background: color-mix(in srgb, var(--st-crit) 12%, transparent); } }
+
+/* ---------- layout ---------- */
+.cols { display: grid; grid-template-columns: 272px minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 980px) { .cols { grid-template-columns: 1fr; } }
+.panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+}
+h3.panel-title {
+  margin: 0 0 10px; font-size: 11px; font-weight: 650; color: var(--ink-2);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+
+/* ---------- controls ---------- */
+.controls { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 12px; }
+.ctl-group { display: flex; flex-direction: column; gap: 9px; }
+.ctl { display: flex; flex-direction: column; gap: 2px; }
+.ctl-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.ctl label { font-size: 12.5px; color: var(--ink-2); }
+.ctl output { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+input[type="range"] { width: 100%; accent-color: var(--qos-g); margin: 0; height: 18px; }
+.preset-row { display: flex; flex-direction: column; gap: 6px; }
+.preset-row button { text-align: left; font-size: 12.5px; padding: 6px 10px; }
+.preset-row button span { display: block; color: var(--muted); font-size: 11px; }
+
+/* ---------- stat tiles ---------- */
+.tiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 10px; margin-bottom: 14px;
+}
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px 8px; }
+.tile .t-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); display: flex; align-items: center; gap: 5px; }
+.tile .t-value { font-size: 25px; font-weight: 640; line-height: 1.15; }
+.tile .t-sub { font-size: 11px; color: var(--ink-2); font-family: var(--mono); min-height: 15px; }
+.dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; flex: none; }
+
+/* ---------- nodes ---------- */
+.nodes-wrap { position: relative; margin-bottom: 14px; }
+#nodes { display: flex; flex-wrap: wrap; gap: 10px; }
+.node {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 9px 10px 8px; width: 128px; flex: 1 1 128px; max-width: 190px;
+  position: relative;
+}
+.node.flash { animation: killFlash 0.9s ease-out; }
+@keyframes killFlash {
+  0% { box-shadow: 0 0 0 3px var(--st-crit); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .node.flash { animation: none; box-shadow: 0 0 0 2px var(--st-crit); }
+  .cascade-chip.active { animation: none; }
+}
+.node-head { display: flex; flex-wrap: nowrap; align-items: center; justify-content: space-between; gap: 6px; }
+.node-name { font-size: 12.5px; font-weight: 650; white-space: nowrap; }
+.chip { font-size: 9px; font-weight: 700; letter-spacing: 0.03em; padding: 2px 6px; border-radius: 999px; text-transform: uppercase; white-space: nowrap; flex: none; }
+.chip.ready { color: var(--st-good); border: 1px solid color-mix(in srgb, var(--st-good) 55%, transparent); }
+.chip.pressure { color: var(--page); background: var(--st-crit); }
+.node-avail { font-size: 11px; color: var(--ink-2); margin: 2px 0 6px; }
+.node-avail b { color: var(--ink); font-weight: 600; }
+.node-bars { display: flex; gap: 6px; align-items: flex-end; }
+.bar {
+  position: relative; height: 236px; border: 1px solid var(--grid);
+  border-radius: 5px; background: var(--page); overflow: hidden;
+}
+.bar.usage { flex: 1; }
+.bar.req { width: 18px; flex: none; }
+.seg { position: absolute; left: 2px; right: 2px; border-radius: 2.5px; }
+.seg.qg { background: var(--qos-g); }
+.seg.qb { background: var(--qos-b); }
+.seg.qbe { background: var(--qos-be); }
+.seg.sys { background: var(--baseline); border-radius: 0; left: 0; right: 0; }
+.seg.leaky {
+  background-image: repeating-linear-gradient(45deg,
+    rgba(0,0,0,0.34) 0 4px, transparent 4px 8px);
+}
+.seg.terminating { opacity: 0.42; }
+.seg.backoff {
+  background: transparent; border: 1px dashed var(--st-crit); height: 5px !important;
+}
+.thline { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid; pointer-events: none; }
+.thline.soft { border-color: var(--st-warn); }
+.thline.hard { border-color: var(--st-crit); }
+.thline.alloc { border-top: 1px solid var(--muted); }
+.req-fill { position: absolute; left: 0; right: 0; bottom: 0; background: color-mix(in srgb, var(--accent) 45%, transparent); }
+.bar-labels { display: flex; gap: 6px; margin-top: 3px; }
+.bar-labels span { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.bar-labels .u { flex: 1; }
+.node-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; gap: 6px; }
+.node-foot .pods-n { font-size: 11px; color: var(--ink-2); font-family: var(--mono); }
+.psi { flex: 1; height: 4px; background: var(--grid); border-radius: 2px; overflow: hidden; }
+.psi i { display: block; height: 100%; border-radius: 2px; background: var(--st-good); transition: width 0.2s linear; }
+#arcs { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+
+/* ---------- lower: chart + log ---------- */
+.lower { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr); gap: 14px; margin-bottom: 14px; }
+@media (max-width: 980px) { .lower { grid-template-columns: 1fr; } }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 8px; }
+.legend span { font-size: 11px; color: var(--ink-2); display: inline-flex; align-items: center; gap: 5px; }
+canvas { display: block; width: 100%; }
+.chart-wrap { position: relative; }
+.chart-tip {
+  position: absolute; pointer-events: none; display: none; z-index: 5;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+  padding: 7px 10px; font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  box-shadow: 0 3px 10px rgba(0,0,0,0.14); white-space: nowrap;
+}
+.spark-title { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; margin: 10px 0 4px; display: flex; justify-content: space-between; }
+.spark-title b { color: var(--ink); font-family: var(--mono); }
+
+/* pod tooltip */
+.pod-tip {
+  position: fixed; pointer-events: none; display: none; z-index: 20;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+  padding: 7px 10px; font-family: var(--mono); font-size: 11px; line-height: 1.55;
+  box-shadow: 0 3px 10px rgba(0,0,0,0.16); white-space: nowrap;
+}
+.pod-tip b { font-size: 12px; }
+
+/* ---------- event log ---------- */
+#log { font-family: var(--mono); font-size: 11px; line-height: 1.7; overflow-y: auto; max-height: 348px; }
+#log .row { display: flex; gap: 8px; white-space: nowrap; }
+#log .t { color: var(--muted); flex: none; width: 52px; }
+#log .k { flex: none; width: 88px; font-weight: 700; }
+#log .d { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; }
+.k.evictSoft, .k.evictHard { color: var(--st-serious); }
+.k.oomKernel { color: var(--st-crit); }
+.k.oomContainer { color: var(--st-warn); }
+.k.pressureOn { color: var(--st-crit); }
+.k.pressureOff { color: var(--st-good); }
+.k.scheduled { color: var(--qos-b); }
+.k.restart, .k.drained { color: var(--muted); }
+.k.leakInjected { color: var(--st-warn); }
+
+/* ---------- model notes ---------- */
+.notes { margin-top: 6px; }
+.notes summary {
+  cursor: pointer; font-weight: 650; font-size: 13.5px; padding: 10px 14px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+}
+.notes[open] summary { border-radius: 10px 10px 0 0; }
+.notes-body {
+  background: var(--surface); border: 1px solid var(--border); border-top: 0;
+  border-radius: 0 0 10px 10px; padding: 6px 22px 22px;
+}
+.notes-body h4 { font-size: 13px; margin: 20px 0 6px; }
+.notes-body p, .notes-body li { font-size: 13px; color: var(--ink-2); max-width: 72ch; }
+.notes-body li { margin: 3px 0; }
+.notes-body code { font-family: var(--mono); font-size: 12px; color: var(--ink); background: var(--page); border: 1px solid var(--grid); border-radius: 4px; padding: 0 4px; }
+.notes-body .tbl { overflow-x: auto; }
+.notes-body table { border-collapse: collapse; font-size: 12.5px; }
+.notes-body th, .notes-body td { text-align: left; padding: 5px 12px 5px 0; border-bottom: 1px solid var(--grid); vertical-align: top; }
+.notes-body th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <h1>Bin-pack &amp; Evict
+      <small>emergent Kubernetes memory-pressure lab — every tick advances a state model; nothing is scripted</small>
+    </h1>
+    <div class="runbar">
+      <span id="cascadeChip" class="cascade-chip">cascade: quiet</span>
+      <span id="clock" class="mono" style="font-size:12px;color:var(--ink-2)">t=0s</span>
+      <button id="btnPlay" class="primary" aria-label="Play or pause simulation">Pause</button>
+      <button id="btnStep">Step</button>
+      <select id="speed" aria-label="Simulation speed">
+        <option value="1">1×</option>
+        <option value="2">2×</option>
+        <option value="5" selected>5×</option>
+        <option value="10">10×</option>
+        <option value="30">30×</option>
+        <option value="60">60×</option>
+      </select>
+      <button id="btnLeak" class="danger">Inject leak</button>
+      <button id="btnReset">Reset ⟲</button>
+    </div>
+  </header>
+
+  <div class="cols">
+    <aside class="controls">
+      <div class="panel">
+        <h3 class="panel-title">Scenarios</h3>
+        <div class="preset-row" id="presets"></div>
+      </div>
+      <div class="panel" id="ctlPanel"></div>
+    </aside>
+
+    <main>
+      <section class="tiles" id="tiles"></section>
+
+      <section class="nodes-wrap">
+        <div id="nodes"></div>
+        <svg id="arcs" aria-hidden="true"></svg>
+      </section>
+
+      <section class="lower">
+        <div class="panel">
+          <h3 class="panel-title">Cluster memory — 10 minute window</h3>
+          <div class="legend">
+            <span><i class="dot" style="background:var(--qos-g)"></i>working set (kernel view)</span>
+            <span><i class="dot" style="background:var(--qos-b)"></i>Σ requests committed (scheduler view)</span>
+            <span><i class="dot" style="background:var(--baseline)"></i>capacity</span>
+            <span><i class="dot" style="background:var(--muted);height:2px"></i>allocatable</span>
+            <span><i class="dot" style="background:var(--st-serious)"></i>eviction</span>
+            <span><i class="dot" style="background:var(--st-crit)"></i>kernel OOM</span>
+            <span><i class="dot" style="background:var(--st-warn)"></i>container OOM</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="chart" height="248"></canvas>
+            <div class="chart-tip" id="chartTip"></div>
+          </div>
+          <div class="spark-title">Pending / unschedulable pods <b id="pendingNow">0</b></div>
+          <canvas id="pending" height="44"></canvas>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">Events</h3>
+          <div id="log" aria-live="off"></div>
+        </div>
+      </section>
+
+      <details class="notes" id="modelNotes">
+        <summary>Model documentation — state-update rules &amp; the cascade feedback loop</summary>
+        <div class="notes-body">
+          <h4>Fidelity commitment</h4>
+          <p>The simulation encodes the specific mechanisms that produce memory-pressure
+          cascades on real clusters, at one-second resolution. Memory is the only resource
+          dimension. Everything you see — including any cascade — is produced by the update
+          rules below acting on state; there is no timeline, no canned sequence, and the
+          RNG is seeded (same seed ⇒ identical run).</p>
+
+          <h4>State-update rules (one tick = 1 s, in this order)</h4>
+          <ul>
+            <li><b>1. Pod working sets.</b> Each running pod's usage follows a mean-reverting
+              approach to a per-pod target: <code>U += (T − U)/τ · s + ε</code>, where
+              <code>ε ~ N(0, σ²)</code> and <code>s = 1 − 0.6·PSI<sub>full</sub></code> is a
+              reclaim-stall throttle. Targets are drawn per pod as a fraction of the
+              <em>limit</em> (default 75% ± 20%, capped at 92%) — apps grow into the room their
+              limit grants, not their request. Leaky pods additionally gain
+              <code>leakRate</code> Mi/s forever. Terminating pods drain linearly over their
+              grace period; backoff pods hold zero.</li>
+            <li><b>2. cgroup v2 <code>memory.max</code>.</b> Any container whose usage reaches
+              its limit is OOM-killed <em>in place</em> (the pod object stays bound): usage → 0,
+              CrashLoopBackOff delay 10 s·2ⁿ capped at 300 s, then restart and regrow.</li>
+            <li><b>3. Kernel OOM (every tick — the kernel doesn't wait for kubelet).</b> If a
+              node's working set (Σ pod usage + system daemons) reaches physical capacity, the
+              kernel kills the container with the highest
+              <code>oom_score = 1000·usage/capacity + oom_score_adj</code>, using kubelet's real
+              adj values: Guaranteed −997, BestEffort 1000, Burstable
+              <code>min(max(2, 1000 − 1000·request/capacity), 999)</code>. Kernel OOM kills
+              restart in place, like rule 2.</li>
+            <li><b>4. Kubelet eviction manager (every 10 s per node, staggered).</b> Signal:
+              <code>memory.available = capacity − workingSet</code>. If below the <em>hard</em>
+              threshold: evict one pod immediately, no grace. If below the <em>soft</em>
+              threshold continuously for the grace period: evict one pod with
+              <code>min(pod grace, eviction-max-pod-grace-period)</code>. Victim ranking is the
+              real one: pods whose usage exceeds requests first (all BestEffort usage
+              qualifies), then lower priority, then largest usage-over-request. Either signal
+              sets the <code>MemoryPressure</code> condition ⇒ <code>NoSchedule</code> taint,
+              held for the pressure-transition period after the signal clears. Eviction marks
+              the pod Failed at once: the scheduler stops counting its requests even while
+              memory drains — a real and consequential gap.</li>
+            <li><b>5. Controller.</b> Each evicted/drained pod's controller creates a
+              replacement after a short informer delay. Restarts (rules 2–3) do <em>not</em>
+              reschedule — that distinction is why leaks crashloop in place but evictions
+              travel. Pod specs are immutable: changing request/limit sliders rolls the
+              workload gradually (bounded replacements per tick), as a Deployment would.</li>
+            <li><b>6. Scheduler.</b> Filters on <em>requests only</em> against
+              <code>allocatable = capacity − reserved − evictionHard</code> (the real allocatable
+              formula — raising the hard threshold genuinely shrinks what the scheduler may
+              book), excludes tainted nodes, then scores by MostAllocated (bin-pack) or
+              LeastAllocated (spread). The scheduler never sees actual usage. Unschedulable
+              pods retry with backoff and are shown as Pending.</li>
+            <li><b>7. Telemetry.</b> Node PSI is derived from proximity to exhaustion
+              (reclaim-stall proxy); metrics and events append to the history that drives the
+              charts.</li>
+          </ul>
+
+          <h4>The feedback loop that makes a cascade</h4>
+          <p>With limits above requests and working sets that track limits, a bin-packed node
+          hosts more demand than it has physical memory — the scheduler booked requests, the
+          kernel serves usage. The loop:
+          <b>growth</b> pushes a packed node's <code>memory.available</code> under a threshold →
+          <b>kubelet evicts</b> (or, if growth outruns the 10 s housekeeping cadence, the
+          <b>kernel OOM-kills</b> first) → the eviction frees <em>requests</em> in the
+          scheduler's books and taints the node → the <b>controller replaces</b> the pod →
+          the <b>scheduler, blind to usage</b>, bin-packs the replacement onto the
+          most-committed untainted node — typically the next-most-loaded one → the replacement
+          <b>regrows toward the same target</b> and tips that node → repeat. Taints concentrate
+          refugees on ever-fewer nodes (accelerating the wave); when transition periods lapse,
+          pods flood back and the wave can oscillate. The loop terminates only when the state
+          makes it terminate: demand shed below capacity, pods parked Pending, or parameters
+          that keep usage inside requests.</p>
+
+          <h4>Prove the emergence to yourself</h4>
+          <ul>
+            <li><b>Relax limits:</b> drag <em>Limit : request</em> to 1.00×. Pods become
+              Guaranteed; usage can no longer exceed what the scheduler booked, so
+              Σ working set ≤ Σ requests ≤ allocatable and no threshold can trip. As the
+              rolling replacement completes, the cascade dies — kills stop, pressure clears.</li>
+            <li><b>Raise thresholds:</b> push soft/hard eviction up (e.g. 1536/1024 Mi). Two
+              real effects compound: allocatable shrinks (scheduler books less per node) and
+              kubelet acts before the kernel — kernel OOMs collapse and the failure mode turns
+              into orderly early eviction + Pending backlog.</li>
+            <li><b>Shrink demand:</b> lower <em>Mean working set</em> to ~45%. Same overcommit
+              ratio, but after a transient the evictions rebalance packing below the hazard
+              density and the cluster goes quiet — the cascade is a property of the state, not
+              of the code path.</li>
+            <li><b>Inject a leak:</b> one Burstable pod with a generous limit drags its node
+              into pressure; watch neighbors get evicted (they exceed requests; the leaker may
+              crashloop in place) and the displaced load propagate.</li>
+          </ul>
+          <p>The same engine (<code>src/engine.js</code>) runs headlessly:
+          <code>node src/verify.mjs</code> asserts all four behaviors plus determinism across
+          seeds. See <code>MODEL.md</code> for the full ground-truth-vs-model table.</p>
+
+          <h4>Deliberate simplifications (and why they're safe here)</h4>
+          <ul>
+            <li>All pod memory is anonymous; page cache isn't modeled. Kubelet's
+              <code>memory.available</code> already excludes reclaimable <code>inactive_file</code>,
+              so this matches the signal's semantics while skipping the reclaim buffer that
+              delays — but doesn't change — the dynamics.</li>
+            <li>PSI is a derived proximity-to-exhaustion proxy shown per node and used only to
+              stall allocation; real kubelets don't act on PSI either (PSI-based eviction is
+              still alpha).</li>
+            <li>One container per pod; CPU, pids, and disk eviction signals omitted; scheduler
+              reduced to NodeResourcesFit + taints (no affinity/spread constraints); kernel OOM
+              kills one victim per pass; <code>--eviction-pressure-transition-period</code>
+              defaults to 60 s here (real default 300 s) so oscillations are watchable.</li>
+          </ul>
+        </div>
+      </details>
+    </main>
+  </div>
+</div>
+<div class="pod-tip" id="podTip"></div>
+<script id="sim-engine">
+/*
+ * k8s bin-packing & memory-pressure eviction — simulation engine.
+ * Pure state model: no DOM, no wall clock, seeded RNG. One tick = one second.
+ * Runs in the browser (window.KSim) and in Node (module.exports) so the same
+ * code that drives the page is verified headlessly by verify.mjs.
+ */
+(function (global) {
+'use strict';
+
+// ---------- deterministic RNG ----------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// stable per-slot trait draw, independent of tick order
+function hash01(n, seed) {
+  let h = (Math.imul(n, 2654435761) ^ Math.imul(seed, 340573321)) >>> 0;
+  h ^= h >>> 16; h = Math.imul(h, 0x45d9f3b); h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+const DEFAULTS = {
+  // cluster
+  nodeCount: 6,
+  nodeCapacityMi: 16384,      // physical RAM per node
+  systemReservedMi: 1536,     // --system-reserved + --kube-reserved
+  systemUsageMi: 1100,        // actual working set of system daemons
+  // workload (one controller-managed slot per replica)
+  replicas: 60,
+  requestMi: 768,
+  limitRatio: 3.0,            // limit = request * ratio; 1.0 => Guaranteed
+  bestEffortFrac: 0.10,       // fraction of slots with no requests/limits
+  targetMeanFrac: 0.75,       // steady-state working set as fraction of limit
+  targetSpreadFrac: 0.20,
+  beTargetMinMi: 128,
+  beTargetMaxMi: 512,
+  growthTauSec: 60,           // exponential approach time constant
+  noiseMi: 4,                 // per-tick gaussian jitter (Mi)
+  leakProb: 0,                // chance a workload slot has a memory leak
+  leakRateMiPerSec: 40,
+  // kubelet eviction manager
+  softEvictionMi: 512,        // evict when memory.available < soft (after grace)
+  softGraceSec: 15,           // --eviction-soft-grace-period
+  hardEvictionMi: 192,        // evict immediately when memory.available < hard
+  housekeepingSec: 10,        // kubelet eviction monitoring interval
+  pressureTransitionSec: 60,  // --eviction-pressure-transition-period (real default 300)
+  maxPodGraceSec: 15,         // --eviction-max-pod-grace-period (soft only)
+  // control plane
+  controllerDelaySec: 3,      // watch/informer latency before replacement pod exists
+  schedulerBindsPerTick: 10,
+  unschedulableRetrySec: 5,
+  scoreStrategy: 'MostAllocated', // bin-pack; or 'LeastAllocated' (spread)
+  maxPodsPerNode: 110,
+  rollingMaxUnavailable: 2,   // rolling replacement rate on spec change
+};
+
+// params that are part of the pod spec: changing them triggers a rolling
+// replacement (pods are immutable in Kubernetes; a Deployment rolls instead)
+const SPEC_PARAMS = ['requestMi', 'limitRatio', 'bestEffortFrac',
+  'targetMeanFrac', 'targetSpreadFrac', 'beTargetMinMi', 'beTargetMaxMi',
+  'leakProb'];
+
+function create(paramsIn, seed) {
+  const params = Object.assign({}, DEFAULTS, paramsIn || {});
+  seed = (seed == null ? 42 : seed) >>> 0;
+  const rng = mulberry32(seed);
+  let gaussSpare = null;
+  function gauss() {
+    if (gaussSpare !== null) { const g = gaussSpare; gaussSpare = null; return g; }
+    let u = 0, v = 0;
+    while (u === 0) u = rng();
+    while (v === 0) v = rng();
+    const m = Math.sqrt(-2 * Math.log(u));
+    gaussSpare = m * Math.sin(2 * Math.PI * v);
+    return m * Math.cos(2 * Math.PI * v);
+  }
+
+  const sim = {
+    params, seed, tickNo: 0, specVersion: 0,
+    nodes: [], pods: [], podById: new Map(), nextPodId: 1,
+    pendingSpawns: [],          // {atTick, slot, gen}
+    leakForced: new Set(),      // slots forced leaky via injectLeak()
+    counters: { evictSoft: 0, evictHard: 0, oomKernel: 0, oomContainer: 0,
+                restarts: 0, reschedules: 0, created: 0, rolled: 0,
+                unschedInsufficient: 0, unschedPressure: 0 },
+    killLog: [],                // {tick, nodeIdx, type, pod}
+    landings: [],               // {tick, nodeIdx} replacement (gen>0) binds
+    chainLinks: 0,              // kills on a node soon after a replacement landed there
+    events: [],                 // rolling human-readable log
+    lastTickEvents: [],
+    history: [],                // per-tick metrics ring
+    historyCap: 1800,
+  };
+
+  // ---------- node helpers ----------
+  function allocatableMi() {
+    // ground truth: Allocatable = Capacity - Reserved - EvictionHard
+    return Math.max(0,
+      params.nodeCapacityMi - params.systemReservedMi - params.hardEvictionMi);
+  }
+  function makeNode(idx) {
+    return {
+      idx, name: 'node-' + (idx + 1),
+      committedMi: 0,           // sum of bound pod requests (scheduler view)
+      podIds: new Set(),
+      workingSetMi: 0, memAvailableMi: params.nodeCapacityMi,
+      psiSome: 0, psiFull: 0,
+      pressure: false,          // MemoryPressure condition (=> NoSchedule taint)
+      softSinceTick: -1,        // first housekeeping observation below soft
+      lastExceededTick: -1,
+    };
+  }
+  function systemUsage(node) {
+    // deterministic daemon jitter (~±3%)
+    return params.systemUsageMi *
+      (1 + 0.03 * Math.sin((sim.tickNo + node.idx * 7) / 29));
+  }
+  function nodeWorkingSet(node) {
+    let ws = systemUsage(node);
+    for (const id of node.podIds) {
+      const p = sim.podById.get(id);
+      if (p) ws += p.usageMi;
+    }
+    return ws;
+  }
+  function refreshNodeSignals(node) {
+    node.workingSetMi = nodeWorkingSet(node);
+    // kubelet signal: memory.available = capacity - workingSet(root cgroup).
+    // Simplification: pod memory is all anonymous (page cache treated as
+    // already-reclaimed inactive_file, which kubelet excludes anyway).
+    node.memAvailableMi = params.nodeCapacityMi - node.workingSetMi;
+    // PSI proxy: reclaim stall rises as free memory approaches zero
+    const band = 0.06 * params.nodeCapacityMi;
+    node.psiSome = clamp(1 - node.memAvailableMi / band, 0, 1);
+    node.psiFull = node.psiSome * node.psiSome;
+  }
+
+  // ---------- pod spec (per workload slot) ----------
+  function slotIsBE(slot) { return hash01(slot * 3 + 1, seed) < params.bestEffortFrac; }
+  function slotLeaky(slot) {
+    return sim.leakForced.has(slot) || hash01(slot * 3 + 2, seed) < params.leakProb;
+  }
+  function makePod(slot, gen) {
+    const isBE = slotIsBE(slot);
+    const requestMi = isBE ? 0 : params.requestMi;
+    const limitMi = isBE ? 0 : Math.round(params.requestMi * params.limitRatio);
+    const qos = isBE ? 'BestEffort'
+      : (limitMi === requestMi ? 'Guaranteed' : 'Burstable');
+    let targetMi;
+    if (isBE) {
+      targetMi = params.beTargetMinMi + hash01(slot * 7 + gen * 13 + 3, seed) *
+        (params.beTargetMaxMi - params.beTargetMinMi);
+    } else {
+      const frac = clamp(
+        params.targetMeanFrac +
+          (hash01(slot * 7 + gen * 13 + 3, seed) * 2 - 1) * params.targetSpreadFrac,
+        0.05, 0.92);
+      targetMi = limitMi * frac;
+    }
+    const pod = {
+      id: sim.nextPodId++, slot, gen,
+      name: 'app-' + slot + '-' + gen,
+      qos, requestMi, limitMi, targetMi,
+      leaky: slotLeaky(slot),
+      priority: 0,
+      state: 'pending',         // pending|running|backoff|terminating|gone
+      nodeIdx: -1,
+      usageMi: 0, baseMi: 24 + rng() * 48,
+      createdTick: sim.tickNo, boundTick: -1,
+      retryAtTick: 0,
+      termEndsTick: -1, termRate: 0,
+      restarts: 0, backoffUntilTick: -1,
+      specVersion: sim.specVersion,
+      unschedReason: null,
+    };
+    sim.pods.push(pod);
+    sim.podById.set(pod.id, pod);
+    sim.counters.created++;
+    return pod;
+  }
+  function removePod(pod) {
+    if (pod.nodeIdx >= 0) {
+      const node = sim.nodes[pod.nodeIdx];
+      if (node) node.podIds.delete(pod.id);
+    }
+    pod.state = 'gone';
+    pod.nodeIdx = -1;
+    pod.usageMi = 0;
+  }
+  function spawnReplacement(slot, gen) {
+    sim.pendingSpawns.push({ atTick: sim.tickNo + params.controllerDelaySec, slot, gen });
+  }
+
+  function logEvent(type, detail, nodeIdx, podName) {
+    const ev = { tick: sim.tickNo, type, detail, nodeIdx, podName };
+    sim.events.push(ev);
+    if (sim.events.length > 500) sim.events.splice(0, sim.events.length - 500);
+    sim.lastTickEvents.push(ev);
+  }
+  function logKill(type, node, pod) {
+    sim.killLog.push({ tick: sim.tickNo, nodeIdx: node.idx, type, pod: pod.name });
+    if (sim.killLog.length > 20000) sim.killLog.splice(0, 5000);
+    // cascade chain witness: did a rescheduled pod land here recently?
+    for (let i = sim.landings.length - 1; i >= 0; i--) {
+      const l = sim.landings[i];
+      if (sim.tickNo - l.tick > 60) break;
+      if (l.nodeIdx === node.idx) { sim.chainLinks++; break; }
+    }
+  }
+
+  // ---------- kill paths ----------
+  function containerKill(pod, type) {
+    // cgroup/kernel OOM kills the container process; the pod object stays on
+    // the node and restarts in place under CrashLoopBackOff.
+    pod.restarts++;
+    sim.counters.restarts++;
+    pod.usageMi = 0;
+    pod.state = 'backoff';
+    const backoff = Math.min(10 * Math.pow(2, Math.min(pod.restarts - 1, 5)), 300);
+    pod.backoffUntilTick = sim.tickNo + backoff;
+    const node = sim.nodes[pod.nodeIdx];
+    if (type === 'oomKernel') sim.counters.oomKernel++;
+    else sim.counters.oomContainer++;
+    logKill(type, node, pod);
+    logEvent(type, 'backoff ' + backoff + 's', node.idx, pod.name);
+  }
+  function oomScoreAdj(pod) {
+    // ground-truth kubelet values
+    if (pod.qos === 'Guaranteed') return -997;
+    if (pod.qos === 'BestEffort') return 1000;
+    return clamp(Math.round(1000 - 1000 * pod.requestMi / params.nodeCapacityMi), 2, 999);
+  }
+  function kernelOOM(node) {
+    // kernel acts every tick, unlike the 10s kubelet loop — this race is real
+    let guard = 0;
+    refreshNodeSignals(node);
+    while (node.memAvailableMi <= 0 && guard++ < 8) {
+      let victim = null, best = -Infinity;
+      for (const id of node.podIds) {
+        const p = sim.podById.get(id);
+        if (!p || p.state !== 'running' || p.usageMi <= 0) continue;
+        const score = Math.round(1000 * p.usageMi / params.nodeCapacityMi) + oomScoreAdj(p);
+        if (score > best) { best = score; victim = p; }
+      }
+      if (!victim) break;
+      containerKill(victim, 'oomKernel');
+      refreshNodeSignals(node);
+    }
+  }
+
+  // kubelet eviction ranking for memory (ground truth):
+  // 1) pods whose usage exceeds requests first, 2) lower priority first,
+  // 3) larger usage-over-request first.
+  function evictionRank(a, b) {
+    const ea = a.usageMi > a.requestMi ? 0 : 1;
+    const eb = b.usageMi > b.requestMi ? 0 : 1;
+    if (ea !== eb) return ea - eb;
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return (b.usageMi - b.requestMi) - (a.usageMi - a.requestMi);
+  }
+  function evictOne(node, graceSec, kind) {
+    const cands = [];
+    for (const id of node.podIds) {
+      const p = sim.podById.get(id);
+      if (p && (p.state === 'running' || p.state === 'backoff')) cands.push(p);
+    }
+    if (!cands.length) return false;
+    cands.sort(evictionRank);
+    const victim = cands[0];
+    // pod phase -> Failed immediately: the controller reacts now, and the
+    // scheduler stops counting its requests, even while memory drains.
+    node.committedMi -= victim.requestMi;
+    if (kind === 'hard') sim.counters.evictHard++; else sim.counters.evictSoft++;
+    logKill(kind === 'hard' ? 'evictHard' : 'evictSoft', node, victim);
+    logEvent(kind === 'hard' ? 'evictHard' : 'evictSoft',
+      'memory.available ' + Math.round(node.memAvailableMi) + 'Mi', node.idx, victim.name);
+    if (graceSec <= 0) {
+      removePod(victim);
+    } else {
+      victim.state = 'terminating';
+      victim.termEndsTick = sim.tickNo + graceSec;
+      victim.termRate = victim.usageMi / graceSec;
+    }
+    spawnReplacement(victim.slot, victim.gen + 1);
+    return true;
+  }
+
+  function housekeeping(node) {
+    refreshNodeSignals(node);
+    const avail = node.memAvailableMi;
+    const underSoft = avail < params.softEvictionMi;
+    const underHard = avail < params.hardEvictionMi;
+
+    if (underSoft) {
+      if (node.softSinceTick < 0) node.softSinceTick = sim.tickNo;
+    } else {
+      node.softSinceTick = -1;
+    }
+
+    if (underSoft || underHard) {
+      node.lastExceededTick = sim.tickNo;
+      if (!node.pressure) {
+        node.pressure = true;
+        logEvent('pressureOn', 'memory.available ' + Math.round(avail) + 'Mi', node.idx);
+      }
+    } else if (node.pressure &&
+        sim.tickNo - node.lastExceededTick >= params.pressureTransitionSec) {
+      // eviction-pressure-transition-period keeps the condition (and taint)
+      // up after the signal clears, damping schedule/evict flapping
+      node.pressure = false;
+      logEvent('pressureOff', '', node.idx);
+    }
+
+    if (underHard) {
+      evictOne(node, 0, 'hard');   // hard eviction: no grace
+    } else if (underSoft && node.softSinceTick >= 0 &&
+        sim.tickNo - node.softSinceTick >= params.softGraceSec) {
+      evictOne(node, Math.max(1, params.maxPodGraceSec), 'soft');
+    }
+  }
+
+  // ---------- scheduler ----------
+  function feasible(node, pod) {
+    if (node.pressure) return false;   // node.kubernetes.io/memory-pressure taint
+    if (node.podIds.size >= params.maxPodsPerNode) return false;
+    // requests-only fit against Allocatable: the scheduler never sees usage
+    return node.committedMi + pod.requestMi <= allocatableMi();
+  }
+  function schedule() {
+    const queue = sim.pods.filter(p =>
+      p.state === 'pending' && p.retryAtTick <= sim.tickNo);
+    queue.sort((a, b) => a.createdTick - b.createdTick || a.id - b.id);
+    let binds = 0;
+    for (const pod of queue) {
+      if (binds >= params.schedulerBindsPerTick) break;
+      const fits = sim.nodes.filter(n => feasible(n, pod));
+      if (!fits.length) {
+        pod.retryAtTick = sim.tickNo + params.unschedulableRetrySec;
+        const anyCapacity = sim.nodes.some(n =>
+          n.podIds.size < params.maxPodsPerNode &&
+          n.committedMi + pod.requestMi <= allocatableMi());
+        pod.unschedReason = anyCapacity ? 'pressure-taint' : 'insufficient-memory';
+        if (anyCapacity) sim.counters.unschedPressure++;
+        else sim.counters.unschedInsufficient++;
+        continue;
+      }
+      let best = null, bestScore = -Infinity;
+      for (const n of fits) {
+        const util = (n.committedMi + pod.requestMi) / Math.max(1, allocatableMi());
+        let score = params.scoreStrategy === 'MostAllocated' ? util : 1 - util;
+        score += rng() * 1e-6; // stable-ish tie break
+        if (score > bestScore) { bestScore = score; best = n; }
+      }
+      pod.state = 'running';
+      pod.nodeIdx = best.idx;
+      pod.boundTick = sim.tickNo;
+      pod.usageMi = pod.baseMi;
+      pod.unschedReason = null;
+      best.podIds.add(pod.id);
+      best.committedMi += pod.requestMi;
+      binds++;
+      if (pod.gen > 0) {
+        sim.counters.reschedules++;
+        sim.landings.push({ tick: sim.tickNo, nodeIdx: best.idx });
+        if (sim.landings.length > 4000) sim.landings.splice(0, 1000);
+      }
+      logEvent('scheduled', pod.gen > 0 ? 'rescheduled (gen ' + pod.gen + ')' : 'initial',
+        best.idx, pod.name);
+    }
+  }
+
+  // ---------- controller (Deployment-ish reconcile) ----------
+  function controller() {
+    // 1) due replacement spawns
+    for (let i = sim.pendingSpawns.length - 1; i >= 0; i--) {
+      const s = sim.pendingSpawns[i];
+      if (s.atTick <= sim.tickNo) {
+        if (s.slot < params.replicas) makePod(s.slot, s.gen);
+        sim.pendingSpawns.splice(i, 1);
+      }
+    }
+    // 2) reconcile desired replica slots
+    const live = new Map(); // slot -> pod (non-gone) or spawn marker
+    for (const p of sim.pods) {
+      if (p.state !== 'gone' && p.state !== 'terminating') live.set(p.slot, p);
+    }
+    for (const s of sim.pendingSpawns) live.set(s.slot, true);
+    for (let slot = 0; slot < params.replicas; slot++) {
+      if (!live.has(slot)) makePod(slot, 0);
+    }
+    for (const p of sim.pods) {
+      if (p.slot >= params.replicas &&
+          (p.state === 'running' || p.state === 'backoff' || p.state === 'pending')) {
+        if (p.state === 'pending') { removePod(p); continue; }
+        const node = sim.nodes[p.nodeIdx];
+        if (node) node.committedMi -= p.requestMi;
+        removePod(p);
+      }
+    }
+    // 3) rolling replacement of stale-spec pods (pods are immutable; a spec
+    // change rolls the workload at a bounded rate)
+    let rolled = 0;
+    for (const p of sim.pods) {
+      if (rolled >= params.rollingMaxUnavailable) break;
+      if (p.specVersion === sim.specVersion) continue;
+      if (p.state === 'pending') { // cheap: replace queued pod spec in place
+        removePod(p); spawnReplacement(p.slot, p.gen + 1); continue;
+      }
+      if (p.state !== 'running' && p.state !== 'backoff') continue;
+      const node = sim.nodes[p.nodeIdx];
+      if (node) node.committedMi -= p.requestMi;
+      p.state = 'terminating';
+      p.termEndsTick = sim.tickNo + 5;
+      p.termRate = p.usageMi / 5;
+      spawnReplacement(p.slot, p.gen + 1);
+      sim.counters.rolled++;
+      rolled++;
+    }
+  }
+
+  // ---------- pod dynamics ----------
+  function growPods() {
+    for (const p of sim.pods) {
+      if (p.state === 'backoff') {
+        if (sim.tickNo >= p.backoffUntilTick) {
+          p.state = 'running';
+          p.usageMi = p.baseMi;
+          logEvent('restart', 'restart #' + p.restarts, p.nodeIdx, p.name);
+        }
+        continue;
+      }
+      if (p.state === 'terminating') {
+        p.usageMi = Math.max(0, p.usageMi - p.termRate);
+        if (sim.tickNo >= p.termEndsTick) removePod(p);
+        continue;
+      }
+      if (p.state !== 'running') continue;
+      const node = sim.nodes[p.nodeIdx];
+      const throttle = node ? 1 - 0.6 * node.psiFull : 1; // reclaim stall slows allocation
+      const drive = (p.targetMi - p.usageMi) / params.growthTauSec;
+      p.usageMi += drive * throttle + gauss() * params.noiseMi;
+      if (p.leaky) p.usageMi += params.leakRateMiPerSec * throttle;
+      p.usageMi = Math.max(8, p.usageMi);
+    }
+  }
+  function containerLimitOOM() {
+    // cgroup v2 memory.max on the pod cgroup (kubelet sets it to the limit)
+    for (const p of sim.pods) {
+      if (p.state === 'running' && p.limitMi > 0 && p.usageMi >= p.limitMi) {
+        containerKill(p, 'oomContainer');
+      }
+    }
+  }
+
+  // ---------- structure changes ----------
+  function reconcileNodes() {
+    while (sim.nodes.length < params.nodeCount) {
+      sim.nodes.push(makeNode(sim.nodes.length));
+    }
+    while (sim.nodes.length > params.nodeCount) {
+      const node = sim.nodes.pop();
+      for (const id of Array.from(node.podIds)) {
+        const p = sim.podById.get(id);
+        if (!p) continue;
+        logEvent('drained', 'node removed', node.idx, p.name);
+        removePod(p);
+        if (p.slot < params.replicas) spawnReplacement(p.slot, p.gen + 1);
+      }
+    }
+  }
+
+  // ---------- public API ----------
+  sim.setParams = function (patch) {
+    let specChanged = false;
+    for (const k of Object.keys(patch)) {
+      if (params[k] === patch[k]) continue;
+      params[k] = patch[k];
+      if (SPEC_PARAMS.indexOf(k) >= 0) specChanged = true;
+    }
+    if (specChanged) sim.specVersion++;
+    reconcileNodes();
+  };
+  sim.injectLeak = function () {
+    const running = sim.pods.filter(p => p.state === 'running' && p.qos !== 'BestEffort');
+    if (!running.length) return null;
+    const p = running[Math.floor(rng() * running.length)];
+    sim.leakForced.add(p.slot);
+    p.leaky = true;
+    logEvent('leakInjected', 'workload slot ' + p.slot + ' now leaks', p.nodeIdx, p.name);
+    return p.name;
+  };
+  sim.allocatableMi = allocatableMi;
+  sim.cascadeInfo = function (windowTicks) {
+    const w = windowTicks || 90;
+    const nodes = new Set();
+    let kills = 0;
+    for (let i = sim.killLog.length - 1; i >= 0; i--) {
+      const k = sim.killLog[i];
+      if (sim.tickNo - k.tick > w) break;
+      kills++; nodes.add(k.nodeIdx);
+    }
+    return { kills, nodes: nodes.size, active: kills >= 6 && nodes.size >= 3,
+             chainLinks: sim.chainLinks };
+  };
+
+  sim.tick = function () {
+    sim.tickNo++;
+    sim.lastTickEvents = [];
+    growPods();
+    containerLimitOOM();
+    for (const node of sim.nodes) {
+      refreshNodeSignals(node);
+      kernelOOM(node);                       // kernel: every tick
+      if ((sim.tickNo + node.idx) % params.housekeepingSec === 0) {
+        housekeeping(node);                  // kubelet: every housekeepingSec
+      }
+    }
+    controller();
+    schedule();
+    for (const node of sim.nodes) refreshNodeSignals(node);
+    // prune gone pods occasionally
+    if (sim.tickNo % 30 === 0) {
+      const keep = [];
+      for (const p of sim.pods) {
+        if (p.state === 'gone') sim.podById.delete(p.id);
+        else keep.push(p);
+      }
+      sim.pods = keep;
+    }
+    // metrics
+    let usage = 0, committed = 0, running = 0, pending = 0, backoff = 0;
+    for (const p of sim.pods) {
+      if (p.state === 'running' || p.state === 'terminating') usage += p.usageMi;
+      if (p.state === 'running') running++;
+      else if (p.state === 'pending') pending++;
+      else if (p.state === 'backoff') backoff++;
+    }
+    for (const n of sim.nodes) { usage += systemUsage(n); committed += n.committedMi; }
+    const kt = { es: 0, eh: 0, ok: 0, oc: 0 };
+    for (const e of sim.lastTickEvents) {
+      if (e.type === 'evictSoft') kt.es++;
+      else if (e.type === 'evictHard') kt.eh++;
+      else if (e.type === 'oomKernel') kt.ok++;
+      else if (e.type === 'oomContainer') kt.oc++;
+    }
+    sim.history.push({
+      tick: sim.tickNo, usage, committed,
+      capacity: params.nodeCapacityMi * sim.nodes.length,
+      allocatable: allocatableMi() * sim.nodes.length,
+      running, pending, backoff, kills: kt,
+      pressureNodes: sim.nodes.filter(n => n.pressure).length,
+    });
+    if (sim.history.length > sim.historyCap) sim.history.splice(0, 200);
+  };
+
+  // ---------- init ----------
+  reconcileNodes();
+  for (let slot = 0; slot < params.replicas; slot++) makePod(slot, 0);
+
+  return sim;
+}
+
+const KSim = { create, DEFAULTS, mulberry32, hash01 };
+if (typeof module !== 'undefined' && module.exports) module.exports = KSim;
+else global.KSim = KSim;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script>
+(function () {
+'use strict';
+/* UI layer: renders engine state and routes live parameter changes.
+ * All dynamics live in the engine; this file only draws and wires inputs. */
+
+const $ = (id) => document.getElementById(id);
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+// ---------- sim lifecycle ----------
+let seed = 42;
+let uiParams = Object.assign({}, KSim.DEFAULTS);
+let sim = KSim.create(uiParams, seed);
+let running = true;
+let speed = 5;
+let acc = 0, lastFrame = performance.now(), lastRender = 0;
+let uiEvents = [];               // events accumulated since last render
+const flashUntil = new Map();    // nodeIdx -> ms timestamp
+const lastEvictNodeBySlot = new Map();
+let arcs = [];                   // {from,to,born}
+
+function resetSim(bumpSeed) {
+  if (bumpSeed) seed = (seed + 1) >>> 0;
+  sim = KSim.create(uiParams, seed);
+  uiEvents = []; arcs = []; flashUntil.clear(); lastEvictNodeBySlot.clear();
+  acc = 0;
+}
+
+function doTicks(n) {
+  for (let i = 0; i < n; i++) {
+    sim.tick();
+    for (const e of sim.lastTickEvents) uiEvents.push(e);
+  }
+  if (uiEvents.length > 400) uiEvents.splice(0, uiEvents.length - 400);
+}
+
+// ---------- controls ----------
+const fmtMi = (v) => v >= 1024 ? (v / 1024).toFixed(v % 1024 ? 1 : 0) + 'Gi' : Math.round(v) + 'Mi';
+const fmtS = (v) => v + 's';
+const fmtPct = (v) => Math.round(v * 100) + '%';
+const CONTROLS = [
+  { group: 'Cluster', items: [
+    { k: 'nodeCount', label: 'Nodes', min: 2, max: 12, step: 1, fmt: String },
+    { k: 'nodeCapacityMi', label: 'Node RAM (capacity)', min: 8192, max: 32768, step: 1024, fmt: fmtMi },
+    { k: 'systemReservedMi', label: 'Reserved (system+kube)', min: 512, max: 4096, step: 128, fmt: fmtMi },
+  ]},
+  { group: 'Workload', items: [
+    { k: 'replicas', label: 'Replicas', min: 10, max: 150, step: 1, fmt: String },
+    { k: 'requestMi', label: 'Memory request', min: 128, max: 4096, step: 64, fmt: fmtMi },
+    { k: 'limitRatio', label: 'Limit : request', min: 1, max: 4, step: 0.05, fmt: (v) => v.toFixed(2) + '×' },
+    { k: 'targetMeanFrac', label: 'Mean working set (of limit)', min: 0.2, max: 0.9, step: 0.01, fmt: fmtPct },
+    { k: 'bestEffortFrac', label: 'BestEffort share', min: 0, max: 0.3, step: 0.01, fmt: fmtPct },
+    { k: 'growthTauSec', label: 'Growth time constant', min: 15, max: 180, step: 5, fmt: fmtS },
+    { k: 'leakRateMiPerSec', label: 'Leak rate', min: 10, max: 150, step: 5, fmt: (v) => v + 'Mi/s' },
+  ]},
+  { group: 'Kubelet eviction', items: [
+    { k: 'softEvictionMi', label: 'Soft: memory.available <', min: 256, max: 2048, step: 32, fmt: fmtMi },
+    { k: 'softGraceSec', label: 'Soft grace period', min: 0, max: 60, step: 1, fmt: fmtS },
+    { k: 'hardEvictionMi', label: 'Hard: memory.available <', min: 64, max: 1280, step: 32, fmt: fmtMi },
+    { k: 'housekeepingSec', label: 'Housekeeping interval', min: 2, max: 30, step: 1, fmt: fmtS },
+    { k: 'pressureTransitionSec', label: 'Pressure transition period', min: 10, max: 300, step: 5, fmt: fmtS },
+    { k: 'maxPodGraceSec', label: 'Max pod grace (soft)', min: 1, max: 60, step: 1, fmt: fmtS },
+  ]},
+];
+const ctlEls = new Map();
+
+function buildControls() {
+  const panel = $('ctlPanel');
+  for (const g of CONTROLS) {
+    const h = document.createElement('h3');
+    h.className = 'panel-title'; h.textContent = g.group;
+    panel.appendChild(h);
+    const wrap = document.createElement('div');
+    wrap.className = 'ctl-group'; wrap.style.marginBottom = '14px';
+    for (const c of g.items) {
+      const div = document.createElement('div'); div.className = 'ctl';
+      const row = document.createElement('div'); row.className = 'ctl-row';
+      const label = document.createElement('label');
+      label.textContent = c.label; label.htmlFor = 'ctl-' + c.k;
+      const out = document.createElement('output');
+      out.textContent = c.fmt(uiParams[c.k]);
+      row.appendChild(label); row.appendChild(out);
+      const input = document.createElement('input');
+      input.type = 'range'; input.id = 'ctl-' + c.k;
+      input.min = c.min; input.max = c.max; input.step = c.step;
+      input.value = uiParams[c.k];
+      input.addEventListener('input', () => {
+        const v = parseFloat(input.value);
+        uiParams[c.k] = v;
+        out.textContent = c.fmt(v);
+        sim.setParams({ [c.k]: v });
+      });
+      div.appendChild(row); div.appendChild(input);
+      wrap.appendChild(div);
+      ctlEls.set(c.k, { input, out, fmt: c.fmt });
+    }
+    panel.appendChild(wrap);
+  }
+  // scheduler strategy
+  const h = document.createElement('h3');
+  h.className = 'panel-title'; h.textContent = 'Scheduler';
+  panel.appendChild(h);
+  const sel = document.createElement('select');
+  sel.setAttribute('aria-label', 'Scheduler scoring strategy');
+  sel.style.width = '100%';
+  for (const [v, t] of [['MostAllocated', 'MostAllocated — bin-pack'],
+                        ['LeastAllocated', 'LeastAllocated — spread']]) {
+    const o = document.createElement('option'); o.value = v; o.textContent = t;
+    sel.appendChild(o);
+  }
+  sel.value = uiParams.scoreStrategy;
+  sel.addEventListener('change', () => {
+    uiParams.scoreStrategy = sel.value;
+    sim.setParams({ scoreStrategy: sel.value });
+  });
+  panel.appendChild(sel);
+  ctlEls.set('scoreStrategy', { input: sel, out: null, fmt: String });
+}
+
+function syncControls() {
+  for (const [k, el] of ctlEls) {
+    el.input.value = uiParams[k];
+    if (el.out) el.out.textContent = el.fmt(uiParams[k]);
+  }
+}
+
+const PRESETS = [
+  { name: 'Overcommitted bin-pack', desc: 'limit 3× request, working sets ~75% of limit — a cascade forms',
+    patch: { limitRatio: 3.0, targetMeanFrac: 0.75, softEvictionMi: 512, hardEvictionMi: 192, scoreStrategy: 'MostAllocated' } },
+  { name: 'Right-sized limits', desc: 'limit = request (Guaranteed) — the cascade cannot form',
+    patch: { limitRatio: 1.0 } },
+  { name: 'Early-eviction headroom', desc: 'soft 1536Mi / hard 1024Mi — kubelet beats the kernel OOM killer',
+    patch: { softEvictionMi: 1536, hardEvictionMi: 1024 } },
+  { name: 'Overcommit that fits', desc: 'same 3× ratio, working sets ~45% — transient churn, then quiet',
+    patch: { limitRatio: 3.0, targetMeanFrac: 0.45 } },
+];
+function buildPresets() {
+  const row = $('presets');
+  for (const p of PRESETS) {
+    const b = document.createElement('button');
+    b.innerHTML = p.name + '<span></span>';
+    b.querySelector('span').textContent = p.desc;
+    b.addEventListener('click', () => {
+      Object.assign(uiParams, p.patch);
+      sim.setParams(p.patch);
+      syncControls();
+    });
+    row.appendChild(b);
+  }
+}
+
+// ---------- stat tiles ----------
+const TILES = [
+  { k: 'running', label: 'Running', dot: 'var(--qos-b)' },
+  { k: 'pending', label: 'Pending', dot: 'var(--accent)' },
+  { k: 'evict', label: 'Evictions', dot: 'var(--st-serious)' },
+  { k: 'oomk', label: 'Kernel OOM', dot: 'var(--st-crit)' },
+  { k: 'oomc', label: 'Container OOM', dot: 'var(--st-warn)' },
+  { k: 'resched', label: 'Reschedules', dot: 'var(--qos-g)' },
+];
+const tileEls = {};
+function buildTiles() {
+  const wrap = $('tiles');
+  for (const t of TILES) {
+    const d = document.createElement('div'); d.className = 'tile';
+    d.innerHTML = '<div class="t-label"><i class="dot"></i>' + t.label +
+      '</div><div class="t-value">0</div><div class="t-sub"></div>';
+    d.querySelector('.dot').style.background = t.dot;
+    wrap.appendChild(d);
+    tileEls[t.k] = { value: d.querySelector('.t-value'), sub: d.querySelector('.t-sub') };
+  }
+}
+function renderTiles() {
+  const h = sim.history[sim.history.length - 1];
+  if (!h) return;
+  const c = sim.counters;
+  tileEls.running.value.textContent = h.running;
+  tileEls.running.sub.textContent = h.backoff ? h.backoff + ' in backoff' : '';
+  tileEls.pending.value.textContent = h.pending;
+  tileEls.pending.sub.textContent = h.pressureNodes ? h.pressureNodes + ' node(s) tainted' : '';
+  tileEls.evict.value.textContent = c.evictSoft + c.evictHard;
+  tileEls.evict.sub.textContent = 'soft ' + c.evictSoft + ' · hard ' + c.evictHard;
+  tileEls.oomk.value.textContent = c.oomKernel;
+  tileEls.oomk.sub.textContent = c.oomKernel ? 'kernel raced 10s kubelet loop' : '';
+  tileEls.oomc.value.textContent = c.oomContainer;
+  tileEls.oomc.sub.textContent = 'cgroup memory.max · ' + c.restarts + ' restarts';
+  tileEls.resched.value.textContent = c.reschedules;
+  tileEls.resched.sub.textContent = sim.chainLinks + ' cascade links';
+  const ci = sim.cascadeInfo(90);
+  const chip = $('cascadeChip');
+  chip.textContent = ci.active
+    ? 'CASCADE · ' + ci.kills + ' kills / ' + ci.nodes + ' nodes (90s)'
+    : 'cascade: quiet' + (ci.kills ? ' · ' + ci.kills + ' kills (90s)' : '');
+  chip.classList.toggle('active', ci.active);
+  const t = sim.tickNo;
+  $('clock').textContent = 't=' + Math.floor(t / 60) + 'm' + String(t % 60).padStart(2, '0') + 's';
+}
+
+// ---------- nodes ----------
+const BAR_H = 236;
+function renderNodes() {
+  const wrap = $('nodes');
+  const cap = sim.params.nodeCapacityMi;
+  const alloc = sim.allocatableMi();
+  const now = performance.now();
+  const frag = document.createDocumentFragment();
+  for (const node of sim.nodes) {
+    const card = document.createElement('div');
+    card.className = 'node' + ((flashUntil.get(node.idx) || 0) > now ? ' flash' : '');
+    card.dataset.idx = node.idx;
+
+    const pods = [];
+    for (const id of node.podIds) {
+      const p = sim.podById.get(id);
+      if (p) pods.push(p);
+    }
+    pods.sort((a, b) => a.boundTick - b.boundTick || a.id - b.id);
+
+    const avail = Math.round(node.memAvailableMi);
+    const head = document.createElement('div'); head.className = 'node-head';
+    head.innerHTML = '<span class="node-name"></span><span class="chip"></span>';
+    head.querySelector('.node-name').textContent = node.name;
+    const chip = head.querySelector('.chip');
+    if (node.pressure) { chip.className = 'chip pressure'; chip.textContent = 'Pressure'; }
+    else { chip.className = 'chip ready'; chip.textContent = 'Ready'; }
+    card.appendChild(head);
+
+    const availEl = document.createElement('div');
+    availEl.className = 'node-avail mono';
+    availEl.innerHTML = 'avail <b></b> · ws ';
+    availEl.querySelector('b').textContent = fmtMi(Math.max(0, avail));
+    availEl.append(fmtMi(Math.round(node.workingSetMi)));
+    card.appendChild(availEl);
+
+    const bars = document.createElement('div'); bars.className = 'node-bars';
+    // kernel view: stacked working sets
+    const ubar = document.createElement('div'); ubar.className = 'bar usage';
+    const sysMi = node.workingSetMi - pods.reduce((s, p) => s + p.usageMi, 0);
+    let cum = 0;
+    const sys = document.createElement('div');
+    sys.className = 'seg sys';
+    sys.style.bottom = '0px';
+    sys.style.height = Math.max(1, sysMi / cap * BAR_H) + 'px';
+    ubar.appendChild(sys);
+    cum += sysMi;
+    let sliver = 0;
+    for (const p of pods) {
+      const seg = document.createElement('div');
+      const qcls = p.qos === 'Guaranteed' ? 'qg' : p.qos === 'Burstable' ? 'qb' : 'qbe';
+      seg.className = 'seg ' + qcls +
+        (p.leaky ? ' leaky' : '') +
+        (p.state === 'terminating' ? ' terminating' : '') +
+        (p.state === 'backoff' ? ' backoff' : '');
+      seg.dataset.pid = p.id;
+      if (p.state === 'backoff') {
+        seg.style.bottom = Math.min(BAR_H - 6, cum / cap * BAR_H + sliver) + 'px';
+        sliver += 7;
+      } else {
+        const h = Math.max(1, p.usageMi / cap * BAR_H - 2);
+        seg.style.bottom = (cum / cap * BAR_H + 1) + 'px';
+        seg.style.height = h + 'px';
+        cum += p.usageMi;
+      }
+      ubar.appendChild(seg);
+    }
+    for (const [cls, mi] of [['soft', sim.params.softEvictionMi], ['hard', sim.params.hardEvictionMi]]) {
+      const l = document.createElement('div');
+      l.className = 'thline ' + cls;
+      l.style.bottom = ((cap - mi) / cap * BAR_H) + 'px';
+      ubar.appendChild(l);
+    }
+    bars.appendChild(ubar);
+    // scheduler view: committed requests vs allocatable
+    const rbar = document.createElement('div'); rbar.className = 'bar req';
+    const rfill = document.createElement('div'); rfill.className = 'req-fill';
+    rfill.style.height = Math.max(0, Math.min(1, node.committedMi / cap)) * BAR_H + 'px';
+    rbar.appendChild(rfill);
+    const al = document.createElement('div');
+    al.className = 'thline alloc';
+    al.style.bottom = (alloc / cap * BAR_H) + 'px';
+    rbar.appendChild(al);
+    bars.appendChild(rbar);
+    card.appendChild(bars);
+
+    const labels = document.createElement('div');
+    labels.className = 'bar-labels';
+    labels.innerHTML = '<span class="u">usage</span><span>req</span>';
+    card.appendChild(labels);
+
+    const foot = document.createElement('div'); foot.className = 'node-foot';
+    const pn = document.createElement('span'); pn.className = 'pods-n';
+    pn.textContent = pods.length + ' pods';
+    const psi = document.createElement('div'); psi.className = 'psi';
+    psi.title = 'PSI (reclaim stall proxy)';
+    const pi = document.createElement('i');
+    pi.style.width = Math.round(node.psiSome * 100) + '%';
+    pi.style.background = node.psiSome > 0.66 ? 'var(--st-crit)'
+      : node.psiSome > 0.33 ? 'var(--st-warn)' : 'var(--st-good)';
+    psi.appendChild(pi);
+    foot.appendChild(pn); foot.appendChild(psi);
+    card.appendChild(foot);
+    frag.appendChild(card);
+  }
+  wrap.replaceChildren(frag);
+}
+
+// pod tooltip (delegated)
+const podTip = $('podTip');
+document.addEventListener('mousemove', (e) => {
+  const seg = e.target.closest && e.target.closest('.seg[data-pid]');
+  if (!seg) { podTip.style.display = 'none'; return; }
+  const p = sim.podById.get(+seg.dataset.pid);
+  if (!p) { podTip.style.display = 'none'; return; }
+  podTip.innerHTML = '<b></b><br>';
+  podTip.querySelector('b').textContent = p.name + ' · ' + p.qos + (p.leaky ? ' · LEAKING' : '');
+  podTip.append(
+    'usage ' + Math.round(p.usageMi) + 'Mi / req ' + p.requestMi + 'Mi / lim ' +
+    (p.limitMi || '∞') + 'Mi');
+  const l2 = document.createElement('div');
+  l2.textContent = 'target ' + Math.round(p.targetMi) + 'Mi · restarts ' + p.restarts +
+    ' · ' + p.state + ' · gen ' + p.gen;
+  podTip.appendChild(l2);
+  podTip.style.display = 'block';
+  const x = Math.min(e.clientX + 14, window.innerWidth - podTip.offsetWidth - 8);
+  const y = Math.min(e.clientY + 14, window.innerHeight - podTip.offsetHeight - 8);
+  podTip.style.left = x + 'px'; podTip.style.top = y + 'px';
+});
+
+// ---------- reschedule arcs & flashes ----------
+function processUiEvents() {
+  const now = performance.now();
+  for (const e of uiEvents) {
+    if (e.type === 'evictSoft' || e.type === 'evictHard' || e.type === 'oomKernel' ||
+        e.type === 'oomContainer') {
+      flashUntil.set(e.nodeIdx, now + 900);
+    }
+    if ((e.type === 'evictSoft' || e.type === 'evictHard' || e.type === 'drained') && e.podName) {
+      const slot = parseInt(e.podName.split('-')[1], 10);
+      if (!isNaN(slot)) lastEvictNodeBySlot.set(slot, e.nodeIdx);
+    }
+    if (e.type === 'scheduled' && e.detail && e.detail.indexOf('rescheduled') === 0 &&
+        !reducedMotion.matches) {
+      const slot = parseInt(e.podName.split('-')[1], 10);
+      const from = lastEvictNodeBySlot.get(slot);
+      if (from != null && from !== e.nodeIdx) {
+        arcs.push({ from, to: e.nodeIdx, born: now });
+        lastEvictNodeBySlot.delete(slot);
+      }
+    }
+  }
+  uiEvents = [];
+  if (arcs.length > 12) arcs.splice(0, arcs.length - 12);
+}
+function renderArcs() {
+  const svg = $('arcs');
+  const wrap = svg.parentElement;
+  svg.setAttribute('viewBox', '0 0 ' + wrap.offsetWidth + ' ' + wrap.offsetHeight);
+  const now = performance.now();
+  arcs = arcs.filter(a => now - a.born < 1400);
+  const cards = $('nodes').children;
+  const center = (idx) => {
+    for (const c of cards) {
+      if (+c.dataset.idx === idx) {
+        return [c.offsetLeft + c.offsetWidth / 2, c.offsetTop + 160];
+      }
+    }
+    return null;
+  };
+  const parts = [];
+  for (const a of arcs) {
+    const p1 = center(a.from), p2 = center(a.to);
+    if (!p1 || !p2) continue;
+    const age = (now - a.born) / 1400;
+    const midX = (p1[0] + p2[0]) / 2;
+    const midY = Math.min(p1[1], p2[1]) - 60;
+    parts.push('<path d="M' + p1[0] + ' ' + p1[1] + ' Q' + midX + ' ' + midY +
+      ' ' + p2[0] + ' ' + p2[1] + '" fill="none" stroke="var(--st-serious)"' +
+      ' stroke-width="1.5" opacity="' + (0.7 * (1 - age)).toFixed(2) + '"/>' +
+      '<circle cx="' + (p1[0] + (p2[0] - p1[0]) * age) + '" cy="' +
+      (p1[1] + (p2[1] - p1[1]) * age - 60 * Math.sin(Math.PI * age)) +
+      '" r="3.5" fill="var(--st-serious)" opacity="' + (1 - age).toFixed(2) + '"/>');
+  }
+  svg.innerHTML = parts.join('');
+}
+
+// ---------- charts ----------
+const WINDOW = 600;
+function themeColors() {
+  const cs = getComputedStyle(document.documentElement);
+  const g = (n) => cs.getPropertyValue(n).trim();
+  return {
+    ink2: g('--ink-2'), muted: g('--muted'), grid: g('--grid'),
+    baseline: g('--baseline'), qg: g('--qos-g'), qb: g('--qos-b'),
+    accent: g('--accent'), warn: g('--st-warn'), serious: g('--st-serious'),
+    crit: g('--st-crit'),
+  };
+}
+function setupCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = +cv.getAttribute('height');
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, w, h];
+}
+let hoverX = null;
+function renderChart() {
+  const cv = $('chart');
+  const [ctx, W, H] = setupCanvas(cv);
+  const C = themeColors();
+  ctx.clearRect(0, 0, W, H);
+  const hist = sim.history.slice(-WINDOW);
+  if (hist.length < 2) return;
+  const stripH = 22, padR = 84, padT = 8;
+  const plotH = H - stripH - padT - 4, plotW = W - padR;
+  const yMax = Math.max(hist[hist.length - 1].capacity,
+    hist.reduce((m, s) => Math.max(m, s.usage), 0)) * 1.06;
+  const x = (i) => i / Math.max(1, hist.length - 1) * plotW;
+  const y = (v) => padT + plotH - (v / yMax) * plotH;
+
+  // grid: quarters of capacity
+  const cap = hist[hist.length - 1].capacity;
+  ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+  for (const f of [0.25, 0.5, 0.75]) {
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y(cap * f)); ctx.lineTo(plotW, y(cap * f)); ctx.stroke();
+  }
+  // capacity + allocatable references
+  const alloc = hist[hist.length - 1].allocatable;
+  for (const [v, col, lab] of [[cap, C.baseline, 'capacity ' + fmtMi(cap)],
+                               [alloc, C.muted, 'allocatable']]) {
+    ctx.strokeStyle = col; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y(v)); ctx.lineTo(plotW, y(v)); ctx.stroke();
+    ctx.fillStyle = C.muted;
+    ctx.fillText(lab, plotW + 6, y(v) + 3);
+  }
+  // series
+  const line = (key, col) => {
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    hist.forEach((s, i) => { i ? ctx.lineTo(x(i), y(s[key])) : ctx.moveTo(x(i), y(s[key])); });
+    ctx.stroke();
+  };
+  line('committed', C.qb);
+  line('usage', C.qg);
+  // direct labels at line ends
+  const last = hist[hist.length - 1];
+  ctx.fillStyle = C.ink2;
+  ctx.fillText('working set', plotW + 6, y(last.usage) + 3);
+  ctx.fillText('requests', plotW + 6, y(last.committed) + 3);
+  // event strip
+  const sy = H - stripH;
+  ctx.strokeStyle = C.grid;
+  ctx.beginPath(); ctx.moveTo(0, sy - 2); ctx.lineTo(plotW, sy - 2); ctx.stroke();
+  hist.forEach((s, i) => {
+    let yy = H - 3;
+    const mark = (n, col) => {
+      if (!n) return;
+      ctx.fillStyle = col;
+      ctx.fillRect(x(i) - 1, yy - 5, 2.5, 5);
+      yy -= 6;
+    };
+    mark(s.kills.es + s.kills.eh, C.serious);
+    mark(s.kills.ok, C.crit);
+    mark(s.kills.oc, C.warn);
+  });
+  // hover crosshair
+  const tip = $('chartTip');
+  if (hoverX != null && hoverX <= plotW) {
+    const i = Math.round(hoverX / plotW * (hist.length - 1));
+    const s = hist[Math.max(0, Math.min(hist.length - 1, i))];
+    ctx.strokeStyle = C.muted; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x(i), padT); ctx.lineTo(x(i), H - 2); ctx.stroke();
+    const kills = s.kills.es + s.kills.eh + s.kills.ok + s.kills.oc;
+    tip.innerHTML = '';
+    const rows = [
+      't=' + s.tick + 's',
+      'working set ' + fmtMi(Math.round(s.usage)),
+      'requests ' + fmtMi(Math.round(s.committed)),
+      'pending ' + s.pending + ' · pressure nodes ' + s.pressureNodes,
+    ];
+    if (kills) rows.push('kills: evict ' + (s.kills.es + s.kills.eh) +
+      ' · kOOM ' + s.kills.ok + ' · cOOM ' + s.kills.oc);
+    for (const r of rows) {
+      const d = document.createElement('div'); d.textContent = r; tip.appendChild(d);
+    }
+    tip.style.display = 'block';
+    const tx = Math.min(x(i) + 12, W - 190);
+    tip.style.left = tx + 'px'; tip.style.top = '10px';
+  } else {
+    tip.style.display = 'none';
+  }
+}
+$('chart').addEventListener('mousemove', (e) => {
+  hoverX = e.offsetX;
+});
+$('chart').addEventListener('mouseleave', () => { hoverX = null; });
+
+function renderPending() {
+  const cv = $('pending');
+  const [ctx, W, H] = setupCanvas(cv);
+  const C = themeColors();
+  ctx.clearRect(0, 0, W, H);
+  const hist = sim.history.slice(-WINDOW);
+  if (hist.length < 2) return;
+  const max = Math.max(5, hist.reduce((m, s) => Math.max(m, s.pending), 0));
+  const x = (i) => i / Math.max(1, hist.length - 1) * (W - 84);
+  const y = (v) => 3 + (H - 7) * (1 - v / max);
+  ctx.strokeStyle = C.accent; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  hist.forEach((s, i) => { i ? ctx.lineTo(x(i), y(s.pending)) : ctx.moveTo(x(i), y(s.pending)); });
+  ctx.stroke();
+  ctx.fillStyle = C.muted;
+  ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+  ctx.fillText('max ' + max, W - 78, 12);
+  $('pendingNow').textContent = hist[hist.length - 1].pending;
+}
+
+// ---------- event log ----------
+const KIND_LABEL = {
+  scheduled: 'sched', evictSoft: 'evict-soft', evictHard: 'evict-hard',
+  oomKernel: 'oom-kernel', oomContainer: 'oom-limit', pressureOn: 'pressure+',
+  pressureOff: 'pressure-', restart: 'restart', leakInjected: 'leak!', drained: 'drained',
+};
+function renderLog() {
+  const log = $('log');
+  const evs = sim.events.slice(-140).reverse();
+  const frag = document.createDocumentFragment();
+  for (const e of evs) {
+    const row = document.createElement('div'); row.className = 'row';
+    const t = document.createElement('span'); t.className = 't';
+    t.textContent = e.tick + 's';
+    const k = document.createElement('span'); k.className = 'k ' + e.type;
+    k.textContent = KIND_LABEL[e.type] || e.type;
+    const d = document.createElement('span'); d.className = 'd';
+    d.textContent = (e.nodeIdx != null && e.nodeIdx >= 0 ? 'node-' + (e.nodeIdx + 1) + ' ' : '') +
+      (e.podName ? e.podName + ' ' : '') + (e.detail || '');
+    row.appendChild(t); row.appendChild(k); row.appendChild(d);
+    frag.appendChild(row);
+  }
+  log.replaceChildren(frag);
+}
+
+// ---------- main loop ----------
+function render() {
+  processUiEvents();
+  renderTiles();
+  renderNodes();
+  renderArcs();
+  renderChart();
+  renderPending();
+  renderLog();
+}
+function frame(now) {
+  const dt = (now - lastFrame) / 1000;
+  lastFrame = now;
+  if (running) {
+    acc += dt * speed;
+    const n = Math.min(120, Math.floor(acc));
+    if (n > 0) { acc -= n; doTicks(n); }
+  }
+  if (now - lastRender > 90 || arcs.length) {
+    lastRender = now;
+    render();
+  } else if (hoverX != null) {
+    renderChart();
+  }
+  requestAnimationFrame(frame);
+}
+
+// ---------- wiring ----------
+$('btnPlay').addEventListener('click', () => {
+  running = !running;
+  $('btnPlay').textContent = running ? 'Pause' : 'Play';
+});
+$('btnStep').addEventListener('click', () => { doTicks(1); render(); });
+$('speed').addEventListener('change', (e) => { speed = +e.target.value; });
+$('btnReset').addEventListener('click', () => { resetSim(true); render(); });
+$('btnLeak').addEventListener('click', () => { sim.injectLeak(); render(); });
+
+buildControls();
+buildPresets();
+buildTiles();
+doTicks(1);
+render();
+requestAnimationFrame(frame);
+
+// test hooks (used by the headless browser check)
+window.__sim = () => sim;
+window.__advance = (n) => { doTicks(n); render(); };
+window.__setParams = (patch) => {
+  Object.assign(uiParams, patch); sim.setParams(patch); syncControls();
+};
+window.__reset = (s) => { if (s != null) seed = s; resetSim(false); render(); };
+})();
+</script>
+</body>
+</html>
