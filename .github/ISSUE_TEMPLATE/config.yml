@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 Model specification (MODEL.md)
+    url: https://github.com/tblakex01/k8s-first-principles/blob/main/MODEL.md
+    about: The authoritative spec — state-update rules, the cascade feedback loop, and the ground-truth-vs-model table. Please skim this before filing a fidelity bug.
